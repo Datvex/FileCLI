@@ -1,2 +1,10 @@
-# FileMerger-CLI
-An interactive CLI tool to merge selected files into a single document. Ideal for providing codebase context to LLMs, featuring a smart memory system to save your file selection preferences.
+# Объединитель файлов
+
+Кроссплатформенный CLI-скрипт для выборочного извлечения содержимого файлов из указанной папки в один текстовый файл. Запоминает ваш выбор для каждой папки между сессиями. Не требует установки зависимостей.
+
+## Установка
+
+1. Создайте файл `merge_files.py` и вставьте в него код скрипта.
+2. Запустите в терминале:
+   ```bash
+   python merge_files.py
