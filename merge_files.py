@@ -6,6 +6,7 @@ import textwrap
 import shlex
 import urllib.parse
 import time
+import atexit
 from pathlib import Path
 
 C_BLUE = "\033[38;2;0;175;255m"
@@ -15,11 +16,65 @@ C_WHITE = "\033[38;2;210;210;210m"
 C_DARK_GRAY = "\033[38;2;80;80;80m"
 C_BOLD = "\033[1m"
 C_RESET = "\033[0m"
-
 C_BG_INPUT = "\033[48;2;45;45;45m"
 
+COLOR_NORMAL = {
+    "blue": "\033[38;2;0;175;255m",
+    "yellow": "\033[38;2;248;246;117m",
+    "gray": "\033[38;2;110;110;110m",
+    "white": "\033[38;2;210;210;210m",
+    "dark_gray": "\033[38;2;80;80;80m",
+    "bold": "\033[1m",
+    "bg_input": "\033[48;2;45;45;45m"
+}
+
+COLOR_DIM = {
+    "blue": "\033[38;2;0;65;95m",
+    "yellow": "\033[38;2;95;94;45m",
+    "gray": "\033[38;2;42;42;42m",
+    "white": "\033[38;2;78;78;78m",
+    "dark_gray": "\033[38;2;28;28;28m",
+    "bold": "",
+    "bg_input": "\033[48;2;22;22;22m"
+}
+
+def set_color_mode(dimmed=False):
+    global C_BLUE, C_YELLOW, C_GRAY, C_WHITE, C_DARK_GRAY, C_BOLD, C_BG_INPUT
+    palette = COLOR_DIM if dimmed else COLOR_NORMAL
+    C_BLUE = palette["blue"]
+    C_YELLOW = palette["yellow"]
+    C_GRAY = palette["gray"]
+    C_WHITE = palette["white"]
+    C_DARK_GRAY = palette["dark_gray"]
+    C_BOLD = palette["bold"]
+    C_BG_INPUT = palette["bg_input"]
+
+old_mode_in = None
+old_mode_out = None
+
 if sys.platform == 'win32':
-    os.system('')
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    hStdIn = kernel32.GetStdHandle(-10)
+    mode = ctypes.c_uint32()
+    kernel32.GetConsoleMode(hStdIn, ctypes.byref(mode))
+    old_mode_in = mode.value
+    new_mode = (mode.value & ~0x0040) | 0x0010 | 0x0080 | 0x0200
+    kernel32.SetConsoleMode(hStdIn, new_mode)
+    
+    hStdOut = kernel32.GetStdHandle(-11)
+    mode_out = ctypes.c_uint32()
+    kernel32.GetConsoleMode(hStdOut, ctypes.byref(mode_out))
+    old_mode_out = mode_out.value
+    new_mode_out = mode_out.value | 0x0004
+    kernel32.SetConsoleMode(hStdOut, new_mode_out)
+
+def restore_console():
+    if sys.platform == 'win32' and old_mode_in is not None:
+        kernel32.SetConsoleMode(hStdIn, old_mode_in)
+        kernel32.SetConsoleMode(hStdOut, old_mode_out)
+
+atexit.register(restore_console)
 
 MEMORY_FILE = Path.home() / ".merge_files_memory.json"
 
@@ -139,6 +194,81 @@ T = {
         "err_save": "保存错误:"
     }
 }
+
+class RawInput:
+    def __enter__(self):
+        if sys.platform != 'win32':
+            import tty, termios
+            self.fd = sys.stdin.fileno()
+            self.old = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, *args):
+        if sys.platform != 'win32':
+            import termios
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+
+def parse_vt_sequence(seq):
+    if seq == '\x1b[A': return 'UP'
+    if seq == '\x1b[B': return 'DOWN'
+    if seq.startswith('\x1b[<') and seq.endswith(('M', 'm')):
+        parts = seq[3:-1].split(';')
+        if len(parts) == 3:
+            cb, cx, cy = parts
+            if cb == '0' and seq.endswith('M'):
+                return ('CLICK', int(cx), int(cy))
+    return seq
+
+def get_event():
+    if sys.platform == 'win32':
+        import msvcrt
+        if msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            if ch == '\x1b':
+                seq = "\x1b"
+                time.sleep(0.01)
+                while msvcrt.kbhit():
+                    seq += msvcrt.getwch()
+                if seq == '\x1b': return 'ESC'
+                return parse_vt_sequence(seq)
+            elif ch in ('\r', '\n'): return 'ENTER'
+            elif ch == '\b': return 'BACKSPACE'
+            elif ch == '\x03': raise KeyboardInterrupt
+            elif ch in ('\x00', '\xe0'):
+                ch2 = msvcrt.getwch()
+                if ch2 == 'H': return 'UP'
+                elif ch2 == 'P': return 'DOWN'
+            else: return ch
+        time.sleep(0.01)
+        return None
+    else:
+        import select
+        r, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if r:
+            ch = sys.stdin.read(1)
+            if ch == '\x1b':
+                r2, _, _ = select.select([sys.stdin], [], [], 0.02)
+                if r2:
+                    seq = '\x1b' + sys.stdin.read(1)
+                    if seq[1] in ('[', 'O'):
+                        while True:
+                            r3, _, _ = select.select([sys.stdin], [], [], 0.01)
+                            if r3:
+                                seq += sys.stdin.read(1)
+                                if seq[-1] in 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz~M':
+                                    break
+                            else:
+                                break
+                    return parse_vt_sequence(seq)
+                else:
+                    return 'ESC'
+            elif ch in ('\n', '\r'): return 'ENTER'
+            elif ch in ('\x7f', '\b'): return 'BACKSPACE'
+            elif ch == '\x03': raise KeyboardInterrupt
+            elif ch == '\x04': raise EOFError
+            else: return ch
+        return None
 
 def clean_path(p):
     if not p:
@@ -266,6 +396,10 @@ def draw_logo():
     C_SHADOW_FG = "\033[38;2;90;90;40m"
     C_SHADOW_BG = "\033[48;2;90;90;40m"
     
+    if C_YELLOW == COLOR_DIM["yellow"]:
+        C_SHADOW_FG = "\033[38;2;34;34;16m"
+        C_SHADOW_BG = "\033[48;2;34;34;16m"
+    
     tw = get_term_width()
     logo_width = len(ASCII_LOGO[0])
     indent = " " * max(0, (tw - logo_width) // 2)
@@ -294,6 +428,91 @@ def print_tip(text, m, bw):
             print(f"{m}      {C_GRAY}{line}{C_RESET}")
     print()
 
+def show_floating_modal(title, items, bg_draw_func):
+    max_len = len(title) + 10
+    for item in items:
+        l = len(item["label"]) + (len(item.get("shortcut", "")) + 4 if item.get("shortcut") else 0)
+        if l > max_len: max_len = l
+    mw = min(80, max(40, max_len + 6))
+    mh = len(items) + 4
+    
+    sys.stdout.write("\033[?1000h\033[?1015h\033[?1006h\033[?25l")
+    sys.stdout.flush()
+    
+    selectable = [i for i, it in enumerate(items) if it["type"] == "item"]
+    if not selectable:
+        sys.stdout.write("\033[?1000l\033[?1015l\033[?1006l\033[0m")
+        sys.stdout.flush()
+        return None
+        
+    sel_pos = 0
+    last_size = (-1, -1)
+    
+    def draw_dimmed_background():
+        try:
+            set_color_mode(True)
+            bg_draw_func()
+        finally:
+            set_color_mode(False)
+    
+    with RawInput():
+        while True:
+            tw = get_term_width()
+            try: th = os.get_terminal_size().lines
+            except: th = 24
+            
+            if (tw, th) != last_size:
+                draw_dimmed_background()
+                last_size = (tw, th)
+                
+            sx = max(1, (tw - mw) // 2)
+            sy = max(1, (th - mh) // 2)
+            
+            sys.stdout.write(f"\033[{sy};{sx}H")
+            sys.stdout.write(f"\033[48;2;30;30;30m\033[38;2;210;210;210m  {title}{' ' * (mw - len(title) - 7)}\033[38;2;110;110;110mesc  \033[0m")
+            sys.stdout.write(f"\033[{sy+1};{sx}H\033[48;2;30;30;30m{' ' * mw}\033[0m")
+            
+            for i, item in enumerate(items):
+                sys.stdout.write(f"\033[{sy+2+i};{sx}H")
+                is_sel = (selectable[sel_pos] == i)
+                
+                if item["type"] == "category":
+                    sys.stdout.write(f"\033[48;2;30;30;30m\033[38;2;0;175;255m  {item['label']}{' ' * (mw - len(item['label']) - 2)}\033[0m")
+                else:
+                    bg = "\033[48;2;248;246;117m" if is_sel else "\033[48;2;30;30;30m"
+                    fg = "\033[38;2;0;0;0m" if is_sel else "\033[38;2;210;210;210m"
+                    s_fg = "\033[38;2;80;80;80m" if is_sel else "\033[38;2;110;110;110m"
+                    
+                    lbl = item["label"]
+                    sh = item.get("shortcut", "")
+                    sp = mw - len(lbl) - len(sh) - 4
+                    sys.stdout.write(f"{bg}{fg}  {lbl}{' ' * sp}{s_fg}{sh}  \033[0m")
+                    
+            sys.stdout.write(f"\033[{sy+2+len(items)};{sx}H\033[48;2;30;30;30m{' ' * mw}\033[0m")
+            sys.stdout.write(f"\033[{sy+3+len(items)};{sx}H\033[48;2;30;30;30m{' ' * mw}\033[0m")
+            sys.stdout.flush()
+            
+            ev = get_event()
+            if ev == 'UP': sel_pos = (sel_pos - 1) % len(selectable)
+            elif ev == 'DOWN': sel_pos = (sel_pos + 1) % len(selectable)
+            elif ev == 'ESC':
+                sys.stdout.write("\033[?1000l\033[?1015l\033[?1006l\033[0m")
+                sys.stdout.flush()
+                return None
+            elif ev == 'ENTER':
+                sys.stdout.write("\033[?1000l\033[?1015l\033[?1006l\033[0m")
+                sys.stdout.flush()
+                return items[selectable[sel_pos]]["id"]
+            elif isinstance(ev, tuple) and ev[0] == 'CLICK':
+                _, mx, my = ev
+                if sx <= mx < sx + mw:
+                    row = my - sy - 2
+                    if 0 <= row < len(items):
+                        if items[row]["type"] == "item":
+                            sys.stdout.write("\033[?1000l\033[?1015l\033[?1006l\033[0m")
+                            sys.stdout.flush()
+                            return items[row]["id"]
+
 def kilo_input(prompt, redraw_callback):
     chars = []
     try:
@@ -319,88 +538,34 @@ def kilo_input(prompt, redraw_callback):
         sys.stdout.flush()
 
         last_size = get_term_width()
-
-        if sys.platform == 'win32':
-            import msvcrt
+        
+        with RawInput():
             while True:
-                if msvcrt.kbhit():
-                    ch = msvcrt.getwch()
-                    if ch == '\x1b':
-                        sys.stdout.write(f"{C_RESET}\033[?25l")
-                        return 'esc'
-                    elif ch in ('\r', '\n'):
-                        sys.stdout.write('\n')
-                        sys.stdout.flush()
-                        sys.stdout.write(f"{C_RESET}\033[?25l")
-                        return ''.join(chars)
-                    elif ch == '\b':
-                        if chars:
-                            chars.pop()
-                            draw_prompt()
-                    elif ch == '\x03':
-                        raise KeyboardInterrupt
-                    elif ch in ('\x00', '\xe0'):
-                        msvcrt.getwch()
-                    else:
-                        chars.append(ch)
+                ev = get_event()
+                curr_size = get_term_width()
+                if curr_size != last_size:
+                    last_size = curr_size
+                    sys.stdout.write(f"{C_RESET}\033[?25l")
+                    tw, bw, m = redraw_callback()
+                    sys.stdout.write(f"{C_WHITE}\033[?25h")
+                    draw_prompt()
+                
+                if ev == 'ESC':
+                    sys.stdout.write(f"{C_RESET}\033[?25l")
+                    return 'esc'
+                elif ev == 'ENTER':
+                    sys.stdout.write('\n')
+                    sys.stdout.flush()
+                    sys.stdout.write(f"{C_RESET}\033[?25l")
+                    return ''.join(chars)
+                elif ev == 'BACKSPACE':
+                    if chars:
+                        chars.pop()
                         draw_prompt()
-                else:
-                    curr_size = get_term_width()
-                    if curr_size != last_size:
-                        last_size = curr_size
-                        sys.stdout.write(f"{C_RESET}\033[?25l")
-                        tw, bw, m = redraw_callback()
-                        sys.stdout.write(f"{C_WHITE}\033[?25h")
-                        draw_prompt()
-                    time.sleep(0.01)
-        else:
-            import tty, termios, select
-            fd = sys.stdin.fileno()
-            old = termios.tcgetattr(fd)
-            try:
-                tty.setcbreak(fd)
-                while True:
-                    r, _, _ = select.select([sys.stdin], [], [], 0.05)
-                    if r:
-                        ch = sys.stdin.read(1)
-                        if ch == '\x1b':
-                            r2, _, _ = select.select([sys.stdin], [], [], 0.05)
-                            if r2:
-                                seq = sys.stdin.read(1)
-                                if seq in ('[', 'O'):
-                                    r3, _, _ = select.select([sys.stdin], [], [], 0.05)
-                                    if r3:
-                                        sys.stdin.read(1)
-                                continue
-                            else:
-                                sys.stdout.write(f"{C_RESET}\033[?25l")
-                                return 'esc'
-                        elif ch in ('\n', '\r'):
-                            sys.stdout.write('\n')
-                            sys.stdout.flush()
-                            sys.stdout.write(f"{C_RESET}\033[?25l")
-                            return ''.join(chars)
-                        elif ch in ('\x7f', '\b'):
-                            if chars:
-                                chars.pop()
-                                draw_prompt()
-                        elif ch == '\x03':
-                            raise KeyboardInterrupt
-                        elif ch == '\x04':
-                            raise EOFError
-                        else:
-                            chars.append(ch)
-                            draw_prompt()
-                    else:
-                        curr_size = get_term_width()
-                        if curr_size != last_size:
-                            last_size = curr_size
-                            sys.stdout.write(f"{C_RESET}\033[?25l")
-                            tw, bw, m = redraw_callback()
-                            sys.stdout.write(f"{C_WHITE}\033[?25h")
-                            draw_prompt()
-            finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                elif isinstance(ev, str) and len(ev) == 1:
+                    chars.append(ev)
+                    draw_prompt()
+
     except KeyboardInterrupt:
         sys.stdout.write(f"{C_RESET}\033[?1049l\033[?25h\n")
         sys.stdout.flush()
@@ -428,93 +593,57 @@ def draw_sys_item(m, bw, label, value):
 def settings_menu(lang, output_dir):
     while True:
         t = T[lang]
-        
-        def draw_main():
-            clear_screen(15)
+        def draw_bg():
+            clear_screen(18)
             draw_logo()
             tw, bw, m = get_layout()
-            draw_header(m, bw, t["settings"])
+            draw_header(m, bw, t["commands"])
             print(f"{m}{C_BLUE}{t['actions']}{C_RESET}")
-            draw_menu_item(m, "1", t["change_path"])
-            draw_menu_item(m, "2", t["change_lang"])
+            draw_menu_item(m, "1", t["start"])
+            draw_menu_item(m, "2", t["settings"])
             print()
+            print(f"{m}{C_BLUE}{t['system']}{C_RESET}")
+            draw_sys_item(m, bw, t["output_path"], output_dir)
             print_tip(t["tip_main"], m, bw)
-            return tw, bw, m
-
-        choice = kilo_input(t["action"], draw_main)
+            
+        items = [
+            {"type": "category", "label": t["settings"]},
+            {"type": "item", "id": "path", "label": t["change_path"]},
+            {"type": "item", "id": "lang", "label": t["change_lang"]}
+        ]
         
-        if is_esc(choice):
+        choice = show_floating_modal(t["settings"], items, draw_bg)
+        
+        if not choice:
             break
-        elif choice == '1':
-            def draw_path():
+        elif choice == 'path':
+            def draw_path_bg():
                 clear_screen(15)
                 draw_logo()
                 tw, bw, m = get_layout()
                 draw_header(m, bw, t["settings"])
                 print()
                 return tw, bw, m
-            
-            raw_path = kilo_input(t["new_path"], draw_path)
+            raw_path = kilo_input(t["new_path"], draw_path_bg)
             if not is_esc(raw_path) and raw_path:
                 new_path = clean_path(raw_path)
                 try:
                     os.makedirs(new_path, exist_ok=True)
                     output_dir = new_path
                     save_config(lang, output_dir)
-                    
-                    def draw_success():
-                        clear_screen(15)
-                        draw_logo()
-                        tw, bw, m = get_layout()
-                        draw_header(m, bw, t["settings"])
-                        print(f"\n{m}{C_WHITE}{t['path_updated']}{C_RESET}\n")
-                        return tw, bw, m
-                        
-                    kilo_input(f"{t['press_enter']}:", draw_success)
-                except Exception as e:
-                    def draw_err():
-                        clear_screen(15)
-                        draw_logo()
-                        tw, bw, m = get_layout()
-                        draw_header(m, bw, t["settings"])
-                        print(f"\n{m}{C_YELLOW}{e}{C_RESET}\n")
-                        return tw, bw, m
-                        
-                    kilo_input(f"{t['press_enter']}:", draw_err)
-        elif choice == '2':
-            def draw_lang():
-                clear_screen(15)
-                draw_logo()
-                tw, bw, m = get_layout()
-                draw_header(m, bw, t["settings"])
-                print(f"\n{m}{C_WHITE}1 - English, 2 - Русский, 3 - 中文{C_RESET}\n")
-                return tw, bw, m
-                
-            l_choice = kilo_input("Language:", draw_lang)
-            
-            if is_esc(l_choice):
-                continue
-                
-            if l_choice == '1':
-                lang = 'en'
-            elif l_choice == '2':
-                lang = 'ru'
-            elif l_choice == '3':
-                lang = 'zh'
-            
-            if l_choice in ['1', '2', '3']:
+                except Exception:
+                    pass
+        elif choice == 'lang':
+            lang_items = [
+                {"type": "category", "label": t["language"]},
+                {"type": "item", "id": "en", "label": "English"},
+                {"type": "item", "id": "ru", "label": "Русский"},
+                {"type": "item", "id": "zh", "label": "中文"}
+            ]
+            new_lang = show_floating_modal(t["change_lang"], lang_items, draw_bg)
+            if new_lang:
+                lang = new_lang
                 save_config(lang, output_dir)
-                t = T[lang]
-                
-                def draw_l_success():
-                    clear_screen(15)
-                    draw_logo()
-                    tw, bw, m = get_layout()
-                    draw_header(m, bw, t["settings"])
-                    print(f"\n{m}{C_WHITE}{t['lang_updated']}{C_RESET}\n")
-                    return tw, bw, m
-                    
-                kilo_input(f"{t['press_enter']}:", draw_l_success)
 
     return lang, output_dir
 
