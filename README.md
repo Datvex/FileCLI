@@ -3,7 +3,7 @@
 **English** | [**Русский**](README_RU.md)
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square)](https://www.python.org/)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20Termux-lightgrey?style=flat-square)]()
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20Termux-lightgrey?style=flat-square)]()
 [![License](https://img.shields.io/badge/license-GPL--3.0-green?style=flat-square)](LICENSE)
 
 An interactive terminal tool that merges your project files into a single document, ready to paste into any LLM context window.
@@ -20,7 +20,7 @@ python merge_files.py
 
 - Navigate your project with a keyboard-driven TUI, no dependencies required
 - Select or deselect individual files; FileCLI remembers your choices per directory
-- Drag and drop folders or files directly into the terminal (Windows, Linux, Termux)
+- Drag and drop folders or files directly into the terminal (Windows, Linux, macOS, Termux)
 - Skips binary files, build artifacts, and `node_modules` automatically
 - Supports English, Russian, and Chinese interfaces
 
@@ -47,6 +47,7 @@ python merge_files.py
 | --- | --- |
 | Windows 10/11 | yes |
 | Linux | yes |
+| macOS | yes |
 | Termux | yes |
 
 ## Usage
