@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.merge_files_memory.json
+extracted_data_*.txt
