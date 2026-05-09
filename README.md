@@ -4,7 +4,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20Termux-lightgrey?style=flat-square)]()
-[![License](https://img.shields.io/badge/license-GPL--3.0-green?style=flat-square)](LICENSE)
+[![License](https://img.shields.io/badge/license-GPL3.0-green?style=flat-square)](LICENSE)
 
 An interactive terminal tool that merges your project files into a single document, ready to paste into any LLM context window.
 
@@ -18,15 +18,15 @@ python merge_files.py
 
 **Key capabilities:**
 
-- Navigate your project with a keyboard-driven TUI, no dependencies required
-- Select or deselect individual files; FileCLI remembers your choices per directory
-- Drag and drop folders or files directly into the terminal (Windows, Linux, macOS, Termux)
-- Skips binary files, build artifacts, and `node_modules` automatically
-- Supports English, Russian, and Chinese interfaces
+* Navigate your project with a keyboard driven TUI, no dependencies required
+* Select or deselect individual files; FileCLI remembers your choices per directory
+* Drag and drop folders or files directly into the terminal (Windows, Linux, macOS, Termux)
+* Skips binary files, build artifacts, and `node_modules` automatically
+* Supports English, Russian, and Chinese interfaces
 
 ## Installation
 
-FileCLI requires no third-party packages, just Python 3.8 or later.
+FileCLI requires no third party packages, just Python 3.8 or later.
 
 **Clone and run:**
 
@@ -63,11 +63,11 @@ The output file is formatted with clear separators between files, so any LLM can
 
 Press `2` from the main menu to open Settings:
 
-- **Output path** – change where merged files are saved
-- **Language** – switch between English, Russian, and Chinese
+* **Output path** — change where merged files are saved
+* **Language** — switch between English, Russian, and Chinese
 
 Settings are saved automatically across sessions.
 
 ## License
 
-[GPL-3.0](LICENSE)
+[GPL3.0](LICENSE)
