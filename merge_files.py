@@ -8,6 +8,9 @@ import urllib.parse
 import time
 import atexit
 import unicodedata
+import tempfile
+import zipfile
+import shutil
 from pathlib import Path
 
 C_BLUE = "\033[38;2;0;175;255m"
@@ -57,6 +60,7 @@ old_mode_in = None
 old_mode_out = None
 win32_available = False
 win_mouse_left_down = False
+_input_queue = []  # Очередь для хранения символов при быстрой вставке
 
 if sys.platform == 'win32':
     import ctypes
@@ -322,7 +326,7 @@ def pad_text(text, width):
     return text + " " * max(0, width - text_width(text))
 
 def flush_input_events():
-    global win_mouse_left_down
+    global win_mouse_left_down, _input_queue
     win_mouse_left_down = False
     if sys.platform == 'win32' and win32_available:
         kernel32.FlushConsoleInputBuffer(hStdIn)
@@ -334,13 +338,14 @@ def flush_input_events():
         except Exception:
             pass
     else:
+        _input_queue.clear()
         try:
             import select
             while True:
                 r, _, _ = select.select([sys.stdin], [], [], 0)
                 if not r:
                     break
-                sys.stdin.read(1)
+                os.read(sys.stdin.fileno(), 4096)
         except Exception:
             pass
 
@@ -443,6 +448,7 @@ def get_win32_event():
     return None
 
 def get_event():
+    global _input_queue
     if sys.platform == 'win32' and win32_available:
         return get_win32_event()
     elif sys.platform == 'win32':
@@ -475,36 +481,63 @@ def get_event():
         return None
     else:
         import select
-        r, _, _ = select.select([sys.stdin], [], [], 0.05)
-        if r:
-            ch = sys.stdin.read(1)
-            if ch == '\x1b':
+        if not _input_queue:
+            r, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if r:
+                try:
+                    data = os.read(sys.stdin.fileno(), 4096).decode('utf-8', errors='replace')
+                    _input_queue.extend(list(data))
+                except Exception:
+                    pass
+
+        if not _input_queue:
+            return None
+
+        ch = _input_queue.pop(0)
+
+        if ch == '\x1b':
+            seq = '\x1b'
+            if not _input_queue:
                 r2, _, _ = select.select([sys.stdin], [], [], 0.02)
                 if r2:
-                    seq = '\x1b' + sys.stdin.read(1)
-                    if len(seq) > 1 and seq[1] in ('[', 'O'):
-                        while True:
-                            r3, _, _ = select.select([sys.stdin], [], [], 0.01)
-                            if r3:
-                                seq += sys.stdin.read(1)
-                                if seq[-1] in 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz~M':
-                                    break
-                            else:
-                                break
-                    return parse_vt_sequence(seq)
-                else:
-                    return 'ESC'
-            elif ch in ('\n', '\r'):
-                return 'ENTER'
-            elif ch in ('\x7f', '\b'):
-                return 'BACKSPACE'
-            elif ch == '\x03':
-                raise KeyboardInterrupt
-            elif ch == '\x04':
-                raise EOFError
+                    try:
+                        data = os.read(sys.stdin.fileno(), 4096).decode('utf-8', errors='replace')
+                        _input_queue.extend(list(data))
+                    except Exception:
+                        pass
+            if _input_queue and _input_queue[0] in ('[', 'O'):
+                seq += _input_queue.pop(0)
+                while True:
+                    if not _input_queue:
+                        r3, _, _ = select.select([sys.stdin], [], [], 0.01)
+                        if r3:
+                            try:
+                                data = os.read(sys.stdin.fileno(), 4096).decode('utf-8', errors='replace')
+                                _input_queue.extend(list(data))
+                            except Exception:
+                                pass
+                        else:
+                            break
+                    if _input_queue:
+                        next_ch = _input_queue.pop(0)
+                        seq += next_ch
+                        if next_ch in 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz~M':
+                            break
+                    else:
+                        break
+                return parse_vt_sequence(seq)
             else:
-                return ch
-        return None
+                return 'ESC'
+        elif ch in ('\n', '\r'):
+            return 'ENTER'
+        elif ch in ('\x7f', '\b'):
+            return 'BACKSPACE'
+        elif ch == '\x03':
+            raise KeyboardInterrupt
+        elif ch == '\x04':
+            raise EOFError
+        else:
+            return ch
 
 def clean_path(p):
     if not p:
@@ -515,6 +548,8 @@ def clean_path(p):
         p = urllib.parse.unquote(p)
         if sys.platform == 'win32' and p.startswith('/') and len(p) > 2 and p[2] == ':':
             p = p[1:]
+    if sys.platform == 'win32' and p.startswith('/') and len(p) >= 2 and p[1].isalpha() and (len(p) == 2 or p[2] == '/'):
+        p = p[1] + ":" + p[2:]
     p = os.path.expanduser(p)
     p = os.path.normpath(p)
     return p
@@ -780,8 +815,10 @@ def kilo_input(prompt, redraw_callback):
             prefix = f" {prompt} "
             avail = max(1, bw - text_width(prefix))
             disp = ''.join(chars)
-            while text_width(disp) > avail and disp:
-                disp = disp[1:]
+            if text_width(disp) > avail:
+                while text_width(disp) > avail - 3 and disp:
+                    disp = disp[1:]
+                disp = "..." + disp
             spaces = max(0, bw - text_width(prefix) - text_width(disp))
             box_render = f"\r{m}{C_BLUE}▌{C_BG_INPUT}{C_GRAY}{prefix}{C_WHITE}{disp}{' ' * spaces}{C_RESET}"
             sys.stdout.write(box_render)
@@ -964,16 +1001,221 @@ def run_script(lang, output_dir):
             return tw, bw, m
         kilo_input(f"{t['press_enter_return']}:", draw_not_found)
         return
-    first_path = paths[0]
+
+    temp_dir = None
     try:
-        if os.path.isdir(first_path):
-            target_dir = first_path
-            all_items = get_all_files(target_dir)
-            dropped_files = []
+        all_items = []
+        for p in paths:
+            if os.path.isfile(p):
+                if p.lower().endswith('.zip') and zipfile.is_zipfile(p):
+                    if not temp_dir:
+                        temp_dir = tempfile.mkdtemp(prefix="merge_zip_")
+                    try:
+                        with zipfile.ZipFile(p, 'r') as zip_ref:
+                            zip_ref.extractall(temp_dir)
+                        all_items.extend(get_all_files(temp_dir))
+                    except Exception:
+                        pass
+                else:
+                    all_items.append(p)
+            elif os.path.isdir(p):
+                all_items.extend(get_all_files(p))
+
+        unique_items = []
+        seen = set()
+        for p in all_items:
+            ap = os.path.abspath(p)
+            if ap not in seen:
+                seen.add(ap)
+                unique_items.append(p)
+        all_items = unique_items
+
+        if not all_items:
+            def draw_empty():
+                clear_screen(13)
+                draw_logo()
+                tw, bw, m = get_layout()
+                draw_header(m, bw, t["target_dir"])
+                print(f"\n{m}{C_YELLOW}{t['err_empty']}{C_RESET}\n")
+                return tw, bw, m
+            kilo_input(f"{t['press_enter_return']}:", draw_empty)
+            return
+
+        if temp_dir:
+            target_dir = temp_dir
+            original_target_dir = paths[0]
         else:
-            target_dir = os.path.dirname(first_path)
-            all_items = get_all_files(target_dir)
-            dropped_files = [os.path.abspath(p) for p in paths if os.path.isfile(p)]
+            if len(paths) == 1 and os.path.isdir(paths[0]):
+                target_dir = paths[0]
+            else:
+                target_dir = os.path.dirname(paths[0])
+            original_target_dir = target_dir
+
+        file_data = []
+        for full_p in all_items:
+            try:
+                f_name = os.path.relpath(full_p, target_dir)
+                if f_name.startswith("..") or os.path.isabs(f_name):
+                    f_name = os.path.basename(full_p)
+            except ValueError:
+                f_name = os.path.basename(full_p)
+            if not (os.path.basename(full_p).startswith("extracted_data_") and full_p.endswith(".txt")):
+                if not is_binary(full_p):
+                    file_data.append({"path": full_p, "name": f_name, "selected": True})
+
+        if not file_data:
+            def draw_empty2():
+                clear_screen(13)
+                draw_logo()
+                tw, bw, m = get_layout()
+                draw_header(m, bw, t["target_dir"])
+                print(f"\n{m}{C_YELLOW}{t['err_empty']}{C_RESET}\n")
+                return tw, bw, m
+            kilo_input(f"{t['press_enter_return']}:", draw_empty2)
+            return
+
+        memory = load_memory()
+        abs_dir = os.path.abspath(original_target_dir)
+        disabled_files = memory.get(abs_dir, {}).get("disabled_files", [])
+        for item in file_data:
+            if item["name"] in disabled_files:
+                item["selected"] = False
+
+        def add_or_select_file(f_list, new_path):
+            abs_p = os.path.abspath(new_path)
+            for i in f_list:
+                if os.path.abspath(i["path"]) == abs_p:
+                    i["selected"] = True
+                    return
+            if not is_binary(abs_p):
+                try:
+                    f_n = os.path.relpath(abs_p, target_dir)
+                    if f_n.startswith("..") or os.path.isabs(f_n):
+                        f_n = os.path.basename(abs_p)
+                except ValueError:
+                    f_n = os.path.basename(abs_p)
+                f_list.append({"path": abs_p, "name": f_n, "selected": True})
+
+        while True:
+            def draw_selection():
+                display_limit = 100
+                total_lines = 17 + min(len(file_data), display_limit)
+                if len(file_data) > display_limit:
+                    total_lines += 1
+                clear_screen(total_lines)
+                draw_logo()
+                tw, bw, m = get_layout()
+                draw_header(m, bw, t["select_files"])
+                dir_display = truncate_text(original_target_dir, bw)
+                print(f"{m}{C_BLUE}{t['dir']}{C_RESET}")
+                print(f"{m}{C_WHITE}{dir_display}{C_RESET}\n")
+                print(f"{m}{C_BLUE}{t['files']}{C_RESET}")
+                for i, item in enumerate(file_data[:display_limit]):
+                    file_disp = truncate_text(item["name"], bw - 6)
+                    num = str(i + 1)
+                    if item["selected"]:
+                        print(f"{m}{C_WHITE}{num:<3}{C_RESET} {C_WHITE}{file_disp}{C_RESET}")
+                    else:
+                        print(f"{m}{C_DARK_GRAY}{num:<3} {file_disp}{C_RESET}")
+                if len(file_data) > display_limit:
+                    rem = len(file_data) - display_limit
+                    print(f"{m}{C_GRAY}... {rem} more files{C_RESET}")
+                selected_count = sum(1 for item in file_data if item["selected"])
+                total_count = len(file_data)
+                print(f"\n{m}{C_GRAY}{t['selected']} {C_WHITE}{selected_count}{C_GRAY} {t['of']} {total_count}{C_RESET}")
+                print_tip(t["tip_toggle"], m, bw)
+                return tw, bw, m
+
+            choice = kilo_input(t["toggle"], draw_selection).strip()
+            if is_esc(choice):
+                return
+            elif choice == '0':
+                break
+            elif choice:
+                c_choice = clean_path(choice)
+                if os.path.exists(c_choice) and os.path.isfile(c_choice):
+                    add_or_select_file(file_data, c_choice)
+                else:
+                    try:
+                        tokens = shlex.split(choice, posix=(os.name == 'posix'))
+                    except ValueError:
+                        tokens = choice.split()
+                    for tok in tokens:
+                        if tok.isdigit():
+                            idx = int(tok) - 1
+                            if 0 <= idx < len(file_data):
+                                file_data[idx]["selected"] = not file_data[idx]["selected"]
+                        else:
+                            ct = clean_path(tok)
+                            if os.path.exists(ct) and os.path.isfile(ct):
+                                add_or_select_file(file_data, ct)
+
+        if not any(item["selected"] for item in file_data):
+            def draw_no_sel():
+                clear_screen(13)
+                draw_logo()
+                tw, bw, m = get_layout()
+                draw_header(m, bw, t["select_files"])
+                print(f"\n{m}{C_YELLOW}{t['err_no_selected']}{C_RESET}\n")
+                return tw, bw, m
+            kilo_input(f"{t['press_enter_return']}:", draw_no_sel)
+            return
+
+        disabled_to_save = [item["name"] for item in file_data if not item["selected"]]
+        save_memory(original_target_dir, disabled_to_save)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_file = os.path.join(output_dir, f"extracted_data_{timestamp}.txt")
+
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            clear_screen(15)
+            draw_logo()
+            tw, bw, m = get_layout()
+            draw_header(m, bw, t["actions"])
+            print(f"\n{m}{C_BLUE}{t.get('exporting', 'Exporting:')}{C_RESET}")
+            sys.stdout.write("\033[s")
+            with open(out_file, 'w', encoding='utf-8') as outfile:
+                selected_items = [item for item in file_data if item["selected"]]
+                total = len(selected_items)
+                for idx, item in enumerate(selected_items, 1):
+                    sys.stdout.write("\033[u\033[J")
+                    sys.stdout.write(f"{m}{C_WHITE}{idx} / {total} : {truncate_text(item['name'], bw - 15)}{C_RESET}\n")
+                    sys.stdout.flush()
+                    filepath = item["path"]
+                    outfile.write(f"--- {item['name']} ---\n")
+                    enc = detect_encoding(filepath)
+                    try:
+                        with open(filepath, 'r', encoding=enc, errors='replace') as infile:
+                            while True:
+                                chunk = infile.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                outfile.write(chunk)
+                    except Exception as e:
+                        outfile.write(f"[Read error: {e}]")
+                    outfile.write("\n\n\n")
+
+            def draw_success():
+                clear_screen(15)
+                draw_logo()
+                tw, bw, m = get_layout()
+                draw_header(m, bw, t["success"])
+                print(f"{m}{C_WHITE}{t['success_msg']}{C_RESET}\n")
+                print(f"{m}{C_BLUE}{t['output_loc']}{C_RESET}")
+                out_display = truncate_text(out_file, bw)
+                print(f"{m}{C_WHITE}{out_display}{C_RESET}\n")
+                return tw, bw, m
+            kilo_input(f"{t['press_enter_return']}:", draw_success)
+        except Exception as e:
+            def draw_save_err():
+                clear_screen(15)
+                draw_logo()
+                tw, bw, m = get_layout()
+                draw_header(m, bw, t["system"])
+                print(f"\n{m}{C_YELLOW}{t['err_save']} {e}{C_RESET}\n")
+                return tw, bw, m
+            kilo_input(f"{t['press_enter_return']}:", draw_save_err)
+
     except PermissionError:
         def draw_perm():
             clear_screen(13)
@@ -983,190 +1225,12 @@ def run_script(lang, output_dir):
             print(f"\n{m}{C_YELLOW}{t['err_permission']}{C_RESET}\n")
             return tw, bw, m
         kilo_input(f"{t['press_enter_return']}:", draw_perm)
-        return
-
-    file_data = []
-    for full_p in all_items:
-        try:
-            f_name = os.path.relpath(full_p, target_dir)
-            if f_name.startswith("..") or os.path.isabs(f_name):
-                f_name = os.path.basename(full_p)
-        except ValueError:
-            f_name = os.path.basename(full_p)
-        if not (os.path.basename(full_p).startswith("extracted_data_") and full_p.endswith(".txt")):
-            if not is_binary(full_p):
-                if os.path.isdir(first_path):
-                    file_data.append({"path": full_p, "name": f_name, "selected": True})
-                else:
-                    is_sel = os.path.abspath(full_p) in dropped_files
-                    file_data.append({"path": full_p, "name": f_name, "selected": is_sel})
-
-    existing_paths = {os.path.abspath(item["path"]) for item in file_data}
-    for p in dropped_files:
-        abs_p = os.path.abspath(p)
-        if abs_p not in existing_paths and os.path.isfile(abs_p):
-            if not is_binary(abs_p):
-                try:
-                    f_name = os.path.relpath(abs_p, target_dir)
-                    if f_name.startswith("..") or os.path.isabs(f_name):
-                        f_name = os.path.basename(abs_p)
-                except ValueError:
-                    f_name = os.path.basename(abs_p)
-                file_data.append({"path": abs_p, "name": f_name, "selected": True})
-                existing_paths.add(abs_p)
-
-    if not file_data:
-        def draw_empty():
-            clear_screen(13)
-            draw_logo()
-            tw, bw, m = get_layout()
-            draw_header(m, bw, t["target_dir"])
-            print(f"\n{m}{C_YELLOW}{t['err_empty']}{C_RESET}\n")
-            return tw, bw, m
-        kilo_input(f"{t['press_enter_return']}:", draw_empty)
-        return
-
-    memory = load_memory()
-    abs_dir = os.path.abspath(target_dir)
-    disabled_files = memory.get(abs_dir, {}).get("disabled_files", [])
-    for item in file_data:
-        if item["name"] in disabled_files:
-            item["selected"] = False
-
-    def add_or_select_file(f_list, new_path):
-        abs_p = os.path.abspath(new_path)
-        for i in f_list:
-            if os.path.abspath(i["path"]) == abs_p:
-                i["selected"] = True
-                return
-        if not is_binary(abs_p):
+    finally:
+        if temp_dir and os.path.exists(temp_dir):
             try:
-                f_name = os.path.relpath(abs_p, target_dir)
-                if f_name.startswith("..") or os.path.isabs(f_name):
-                    f_name = os.path.basename(abs_p)
-            except ValueError:
-                f_name = os.path.basename(abs_p)
-            f_list.append({"path": abs_p, "name": f_name, "selected": True})
-
-    while True:
-        def draw_selection():
-            display_limit = 100
-            total_lines = 17 + min(len(file_data), display_limit)
-            if len(file_data) > display_limit:
-                total_lines += 1
-            clear_screen(total_lines)
-            draw_logo()
-            tw, bw, m = get_layout()
-            draw_header(m, bw, t["select_files"])
-            dir_display = truncate_text(target_dir, bw)
-            print(f"{m}{C_BLUE}{t['dir']}{C_RESET}")
-            print(f"{m}{C_WHITE}{dir_display}{C_RESET}\n")
-            print(f"{m}{C_BLUE}{t['files']}{C_RESET}")
-            for i, item in enumerate(file_data[:display_limit]):
-                file_disp = truncate_text(item["name"], bw - 6)
-                num = str(i + 1)
-                if item["selected"]:
-                    print(f"{m}{C_WHITE}{num:<3}{C_RESET} {C_WHITE}{file_disp}{C_RESET}")
-                else:
-                    print(f"{m}{C_DARK_GRAY}{num:<3} {file_disp}{C_RESET}")
-            if len(file_data) > display_limit:
-                rem = len(file_data) - display_limit
-                print(f"{m}{C_GRAY}... {rem} more files{C_RESET}")
-            selected_count = sum(1 for item in file_data if item["selected"])
-            total_count = len(file_data)
-            print(f"\n{m}{C_GRAY}{t['selected']} {C_WHITE}{selected_count}{C_GRAY} {t['of']} {total_count}{C_RESET}")
-            print_tip(t["tip_toggle"], m, bw)
-            return tw, bw, m
-
-        choice = kilo_input(t["toggle"], draw_selection).strip()
-        if is_esc(choice):
-            return
-        elif choice == '0':
-            break
-        elif choice:
-            c_choice = clean_path(choice)
-            if os.path.exists(c_choice) and os.path.isfile(c_choice):
-                add_or_select_file(file_data, c_choice)
-            else:
-                try:
-                    tokens = shlex.split(choice, posix=(os.name == 'posix'))
-                except ValueError:
-                    tokens = choice.split()
-                for tok in tokens:
-                    if tok.isdigit():
-                        idx = int(tok) - 1
-                        if 0 <= idx < len(file_data):
-                            file_data[idx]["selected"] = not file_data[idx]["selected"]
-                    else:
-                        ct = clean_path(tok)
-                        if os.path.exists(ct) and os.path.isfile(ct):
-                            add_or_select_file(file_data, ct)
-
-    if not any(item["selected"] for item in file_data):
-        def draw_no_sel():
-            clear_screen(13)
-            draw_logo()
-            tw, bw, m = get_layout()
-            draw_header(m, bw, t["select_files"])
-            print(f"\n{m}{C_YELLOW}{t['err_no_selected']}{C_RESET}\n")
-            return tw, bw, m
-        kilo_input(f"{t['press_enter_return']}:", draw_no_sel)
-        return
-
-    disabled_to_save = [item["name"] for item in file_data if not item["selected"]]
-    save_memory(target_dir, disabled_to_save)
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_file = os.path.join(output_dir, f"extracted_data_{timestamp}.txt")
-
-    try:
-        os.makedirs(output_dir, exist_ok=True)
-        clear_screen(15)
-        draw_logo()
-        tw, bw, m = get_layout()
-        draw_header(m, bw, t["actions"])
-        print(f"\n{m}{C_BLUE}{t.get('exporting', 'Exporting:')}{C_RESET}")
-        sys.stdout.write("\033[s")
-        with open(out_file, 'w', encoding='utf-8') as outfile:
-            selected_items = [item for item in file_data if item["selected"]]
-            total = len(selected_items)
-            for idx, item in enumerate(selected_items, 1):
-                sys.stdout.write("\033[u\033[J")
-                sys.stdout.write(f"{m}{C_WHITE}{idx} / {total} : {truncate_text(item['name'], bw - 15)}{C_RESET}\n")
-                sys.stdout.flush()
-                filepath = item["path"]
-                outfile.write(f"--- {item['name']} ---\n")
-                enc = detect_encoding(filepath)
-                try:
-                    with open(filepath, 'r', encoding=enc, errors='replace') as infile:
-                        while True:
-                            chunk = infile.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            outfile.write(chunk)
-                except Exception as e:
-                    outfile.write(f"[Read error: {e}]")
-                outfile.write("\n\n\n")
-
-        def draw_success():
-            clear_screen(15)
-            draw_logo()
-            tw, bw, m = get_layout()
-            draw_header(m, bw, t["success"])
-            print(f"{m}{C_WHITE}{t['success_msg']}{C_RESET}\n")
-            print(f"{m}{C_BLUE}{t['output_loc']}{C_RESET}")
-            out_display = truncate_text(out_file, bw)
-            print(f"{m}{C_WHITE}{out_display}{C_RESET}\n")
-            return tw, bw, m
-        kilo_input(f"{t['press_enter_return']}:", draw_success)
-    except Exception as e:
-        def draw_save_err():
-            clear_screen(15)
-            draw_logo()
-            tw, bw, m = get_layout()
-            draw_header(m, bw, t["system"])
-            print(f"\n{m}{C_YELLOW}{t['err_save']} {e}{C_RESET}\n")
-            return tw, bw, m
-        kilo_input(f"{t['press_enter_return']}:", draw_save_err)
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     sys.stdout.write("\033[?1049h\033[?25l")
